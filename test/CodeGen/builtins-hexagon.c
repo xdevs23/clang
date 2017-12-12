@@ -2346,22 +2346,6 @@ void foo() {
   // CHECK: @llvm.hexagon.V6.vlsrw
   __builtin_HEXAGON_V6_vlsrwv(v16, v16);
   // CHECK: @llvm.hexagon.V6.vlsrwv
-  __builtin_HEXAGON_V6_vlutb_128B(v32, 0, 0);
-  // CHECK: @llvm.hexagon.V6.vlutb.128B
-  __builtin_HEXAGON_V6_vlutb_acc_128B(v32, v32, 0, 0);
-  // CHECK: @llvm.hexagon.V6.vlutb.acc.128B
-  __builtin_HEXAGON_V6_vlutb_acc(v16, v16, 0, 0);
-  // CHECK: @llvm.hexagon.V6.vlutb.acc
-  __builtin_HEXAGON_V6_vlutb_dv_128B(v64, 0, 0);
-  // CHECK: @llvm.hexagon.V6.vlutb.dv.128B
-  __builtin_HEXAGON_V6_vlutb_dv_acc_128B(v64, v64, 0, 0);
-  // CHECK: @llvm.hexagon.V6.vlutb.dv.acc.128B
-  __builtin_HEXAGON_V6_vlutb_dv_acc(v32, v32, 0, 0);
-  // CHECK: @llvm.hexagon.V6.vlutb.dv.acc
-  __builtin_HEXAGON_V6_vlutb_dv(v32, 0, 0);
-  // CHECK: @llvm.hexagon.V6.vlutb.dv
-  __builtin_HEXAGON_V6_vlutb(v16, 0, 0);
-  // CHECK: @llvm.hexagon.V6.vlutb
   __builtin_HEXAGON_V6_vlutvvb_128B(v32, v32, 0);
   // CHECK: @llvm.hexagon.V6.vlutvvb.128B
   __builtin_HEXAGON_V6_vlutvvb_oracc_128B(v32, v32, v32, 0);
@@ -2962,4 +2946,16 @@ void foo() {
   // CHECK: @llvm.hexagon.V6.vzh.128B
   __builtin_HEXAGON_V6_vzh(v16);
   // CHECK: @llvm.hexagon.V6.vzh
+  __builtin_HEXAGON_Y2_dccleana(0);
+  // CHECK: @llvm.hexagon.Y2.dccleana
+  __builtin_HEXAGON_Y2_dccleaninva(0);
+  // CHECK: @llvm.hexagon.Y2.dccleaninva
+  __builtin_HEXAGON_Y2_dcinva(0);
+  // CHECK: @llvm.hexagon.Y2.dcinva
+  __builtin_HEXAGON_Y2_dczeroa(0);
+  // CHECK: @llvm.hexagon.Y2.dczeroa
+  __builtin_HEXAGON_Y4_l2fetch(0, 0);
+  // CHECK: @llvm.hexagon.Y4.l2fetch
+  __builtin_HEXAGON_Y5_l2fetch(0, 0);
+  // CHECK: @llvm.hexagon.Y5.l2fetch
 }

@@ -244,9 +244,6 @@ public:
   void addImplicitStructorParams(CodeGenFunction &CGF, QualType &ResTy,
                                  FunctionArgList &Params) override;
 
-  llvm::Value *adjustThisParameterInVirtualFunctionPrologue(
-      CodeGenFunction &CGF, GlobalDecl GD, llvm::Value *This) override;
-
   void EmitInstanceFunctionProlog(CodeGenFunction &CGF) override;
 
   AddedStructorArgs
@@ -819,46 +816,44 @@ MicrosoftCXXABI::getRecordArgABI(const CXXRecordDecl *RD) const {
     return RAA_Default;
 
   case llvm::Triple::x86_64:
-    // Win64 passes objects with non-trivial copy ctors indirectly.
-    if (RD->hasNonTrivialCopyConstructor())
-      return RAA_Indirect;
-
-    // If an object has a destructor, we'd really like to pass it indirectly
+    // If a class has a destructor, we'd really like to pass it indirectly
     // because it allows us to elide copies.  Unfortunately, MSVC makes that
     // impossible for small types, which it will pass in a single register or
     // stack slot. Most objects with dtors are large-ish, so handle that early.
     // We can't call out all large objects as being indirect because there are
     // multiple x64 calling conventions and the C++ ABI code shouldn't dictate
     // how we pass large POD types.
+    //
+    // Note: This permits small classes with nontrivial destructors to be
+    // passed in registers, which is non-conforming.
     if (RD->hasNonTrivialDestructor() &&
         getContext().getTypeSize(RD->getTypeForDecl()) > 64)
       return RAA_Indirect;
 
-    // If this is true, the implicit copy constructor that Sema would have
-    // created would not be deleted. FIXME: We should provide a more direct way
-    // for CodeGen to ask whether the constructor was deleted.
-    if (!RD->hasUserDeclaredCopyConstructor() &&
-        !RD->hasUserDeclaredMoveConstructor() &&
-        !RD->needsOverloadResolutionForMoveConstructor() &&
-        !RD->hasUserDeclaredMoveAssignment() &&
-        !RD->needsOverloadResolutionForMoveAssignment())
-      return RAA_Default;
-
-    // Otherwise, Sema should have created an implicit copy constructor if
-    // needed.
-    assert(!RD->needsImplicitCopyConstructor());
-
-    // We have to make sure the trivial copy constructor isn't deleted.
-    for (const CXXConstructorDecl *CD : RD->ctors()) {
-      if (CD->isCopyConstructor()) {
-        assert(CD->isTrivial());
-        // We had at least one undeleted trivial copy ctor.  Return directly.
-        if (!CD->isDeleted())
-          return RAA_Default;
+    // If a class has at least one non-deleted, trivial copy constructor, it
+    // is passed according to the C ABI. Otherwise, it is passed indirectly.
+    //
+    // Note: This permits classes with non-trivial copy or move ctors to be
+    // passed in registers, so long as they *also* have a trivial copy ctor,
+    // which is non-conforming.
+    if (RD->needsImplicitCopyConstructor()) {
+      // If the copy ctor has not yet been declared, we can read its triviality
+      // off the AST.
+      if (!RD->defaultedCopyConstructorIsDeleted() &&
+          RD->hasTrivialCopyConstructor())
+        return RAA_Default;
+    } else {
+      // Otherwise, we need to find the copy constructor(s) and ask.
+      for (const CXXConstructorDecl *CD : RD->ctors()) {
+        if (CD->isCopyConstructor()) {
+          // We had at least one nondeleted trivial copy ctor.  Return directly.
+          if (!CD->isDeleted() && CD->isTrivial())
+            return RAA_Default;
+        }
       }
     }
 
-    // The trivial copy constructor was deleted.  Return indirectly.
+    // We have no trivial, non-deleted copy constructor.
     return RAA_Indirect;
   }
 
@@ -1413,11 +1408,10 @@ void MicrosoftCXXABI::addImplicitStructorParams(CodeGenFunction &CGF,
   const CXXMethodDecl *MD = cast<CXXMethodDecl>(CGF.CurGD.getDecl());
   assert(isa<CXXConstructorDecl>(MD) || isa<CXXDestructorDecl>(MD));
   if (isa<CXXConstructorDecl>(MD) && MD->getParent()->getNumVBases()) {
-    ImplicitParamDecl *IsMostDerived
-      = ImplicitParamDecl::Create(Context, nullptr,
-                                  CGF.CurGD.getDecl()->getLocation(),
-                                  &Context.Idents.get("is_most_derived"),
-                                  Context.IntTy);
+    auto *IsMostDerived = ImplicitParamDecl::Create(
+        Context, /*DC=*/nullptr, CGF.CurGD.getDecl()->getLocation(),
+        &Context.Idents.get("is_most_derived"), Context.IntTy,
+        ImplicitParamDecl::Other);
     // The 'most_derived' parameter goes second if the ctor is variadic and last
     // if it's not.  Dtors can't be variadic.
     const FunctionProtoType *FPT = MD->getType()->castAs<FunctionProtoType>();
@@ -1427,36 +1421,13 @@ void MicrosoftCXXABI::addImplicitStructorParams(CodeGenFunction &CGF,
       Params.push_back(IsMostDerived);
     getStructorImplicitParamDecl(CGF) = IsMostDerived;
   } else if (isDeletingDtor(CGF.CurGD)) {
-    ImplicitParamDecl *ShouldDelete
-      = ImplicitParamDecl::Create(Context, nullptr,
-                                  CGF.CurGD.getDecl()->getLocation(),
-                                  &Context.Idents.get("should_call_delete"),
-                                  Context.IntTy);
+    auto *ShouldDelete = ImplicitParamDecl::Create(
+        Context, /*DC=*/nullptr, CGF.CurGD.getDecl()->getLocation(),
+        &Context.Idents.get("should_call_delete"), Context.IntTy,
+        ImplicitParamDecl::Other);
     Params.push_back(ShouldDelete);
     getStructorImplicitParamDecl(CGF) = ShouldDelete;
   }
-}
-
-llvm::Value *MicrosoftCXXABI::adjustThisParameterInVirtualFunctionPrologue(
-    CodeGenFunction &CGF, GlobalDecl GD, llvm::Value *This) {
-  // In this ABI, every virtual function takes a pointer to one of the
-  // subobjects that first defines it as the 'this' parameter, rather than a
-  // pointer to the final overrider subobject. Thus, we need to adjust it back
-  // to the final overrider subobject before use.
-  // See comments in the MicrosoftVFTableContext implementation for the details.
-  CharUnits Adjustment = getVirtualFunctionPrologueThisAdjustment(GD);
-  if (Adjustment.isZero())
-    return This;
-
-  unsigned AS = cast<llvm::PointerType>(This->getType())->getAddressSpace();
-  llvm::Type *charPtrTy = CGF.Int8Ty->getPointerTo(AS),
-             *thisTy = This->getType();
-
-  This = CGF.Builder.CreateBitCast(This, charPtrTy);
-  assert(Adjustment.isPositive());
-  This = CGF.Builder.CreateConstInBoundsGEP1_32(CGF.Int8Ty, This,
-                                                -Adjustment.getQuantity());
-  return CGF.Builder.CreateBitCast(This, thisTy);
 }
 
 void MicrosoftCXXABI::EmitInstanceFunctionProlog(CodeGenFunction &CGF) {
@@ -1464,23 +1435,49 @@ void MicrosoftCXXABI::EmitInstanceFunctionProlog(CodeGenFunction &CGF) {
   if (CGF.CurFuncDecl && CGF.CurFuncDecl->hasAttr<NakedAttr>())
     return;
 
-  EmitThisParam(CGF);
+  // Overridden virtual methods of non-primary bases need to adjust the incoming
+  // 'this' pointer in the prologue. In this hierarchy, C::b will subtract
+  // sizeof(void*) to adjust from B* to C*:
+  //   struct A { virtual void a(); };
+  //   struct B { virtual void b(); };
+  //   struct C : A, B { virtual void b(); };
+  //
+  // Leave the value stored in the 'this' alloca unadjusted, so that the
+  // debugger sees the unadjusted value. Microsoft debuggers require this, and
+  // will apply the ThisAdjustment in the method type information.
+  // FIXME: Do something better for DWARF debuggers, which won't expect this,
+  // without making our codegen depend on debug info settings.
+  llvm::Value *This = loadIncomingCXXThis(CGF);
+  const CXXMethodDecl *MD = cast<CXXMethodDecl>(CGF.CurGD.getDecl());
+  if (!CGF.CurFuncIsThunk && MD->isVirtual()) {
+    CharUnits Adjustment = getVirtualFunctionPrologueThisAdjustment(CGF.CurGD);
+    if (!Adjustment.isZero()) {
+      unsigned AS = cast<llvm::PointerType>(This->getType())->getAddressSpace();
+      llvm::Type *charPtrTy = CGF.Int8Ty->getPointerTo(AS),
+                 *thisTy = This->getType();
+      This = CGF.Builder.CreateBitCast(This, charPtrTy);
+      assert(Adjustment.isPositive());
+      This = CGF.Builder.CreateConstInBoundsGEP1_32(CGF.Int8Ty, This,
+                                                    -Adjustment.getQuantity());
+      This = CGF.Builder.CreateBitCast(This, thisTy, "this.adjusted");
+    }
+  }
+  setCXXABIThisValue(CGF, This);
 
-  /// If this is a function that the ABI specifies returns 'this', initialize
-  /// the return slot to 'this' at the start of the function.
-  ///
-  /// Unlike the setting of return types, this is done within the ABI
-  /// implementation instead of by clients of CGCXXABI because:
-  /// 1) getThisValue is currently protected
-  /// 2) in theory, an ABI could implement 'this' returns some other way;
-  ///    HasThisReturn only specifies a contract, not the implementation    
+  // If this is a function that the ABI specifies returns 'this', initialize
+  // the return slot to 'this' at the start of the function.
+  //
+  // Unlike the setting of return types, this is done within the ABI
+  // implementation instead of by clients of CGCXXABI because:
+  // 1) getThisValue is currently protected
+  // 2) in theory, an ABI could implement 'this' returns some other way;
+  //    HasThisReturn only specifies a contract, not the implementation
   if (HasThisReturn(CGF.CurGD))
     CGF.Builder.CreateStore(getThisValue(CGF), CGF.ReturnValue);
   else if (hasMostDerivedReturn(CGF.CurGD))
     CGF.Builder.CreateStore(CGF.EmitCastToVoidPtr(getThisValue(CGF)),
                             CGF.ReturnValue);
 
-  const CXXMethodDecl *MD = cast<CXXMethodDecl>(CGF.CurGD.getDecl());
   if (isa<CXXConstructorDecl>(MD) && MD->getParent()->getNumVBases()) {
     assert(getStructorImplicitParamDecl(CGF) &&
            "no implicit parameter for a constructor with virtual bases?");
@@ -1965,7 +1962,7 @@ llvm::Function *MicrosoftCXXABI::EmitVirtualMemPtrThunk(
   // Start defining the function.
   CGF.StartFunction(GlobalDecl(), FnInfo.getReturnType(), ThunkFn, FnInfo,
                     FunctionArgs, MD->getLocation(), SourceLocation());
-  EmitThisParam(CGF);
+  setCXXABIThisValue(CGF, loadIncomingCXXThis(CGF));
 
   // Load the vfptr and then callee from the vftable.  The callee should have
   // adjusted 'this' so that the vfptr is at offset zero.
@@ -2465,11 +2462,12 @@ void MicrosoftCXXABI::EmitGuardedInit(CodeGenFunction &CGF, const VarDecl &D,
     // Test our bit from the guard variable.
     llvm::ConstantInt *Bit = llvm::ConstantInt::get(GuardTy, 1ULL << GuardNum);
     llvm::LoadInst *LI = Builder.CreateLoad(GuardAddr);
-    llvm::Value *IsInitialized =
-        Builder.CreateICmpNE(Builder.CreateAnd(LI, Bit), Zero);
+    llvm::Value *NeedsInit =
+        Builder.CreateICmpEQ(Builder.CreateAnd(LI, Bit), Zero);
     llvm::BasicBlock *InitBlock = CGF.createBasicBlock("init");
     llvm::BasicBlock *EndBlock = CGF.createBasicBlock("init.end");
-    Builder.CreateCondBr(IsInitialized, EndBlock, InitBlock);
+    CGF.EmitCXXGuardedInitBranch(NeedsInit, InitBlock, EndBlock,
+                                 CodeGenFunction::GuardKind::VariableGuard, &D);
 
     // Set our bit in the guard variable and emit the initializer and add a global
     // destructor if appropriate.
@@ -2504,7 +2502,8 @@ void MicrosoftCXXABI::EmitGuardedInit(CodeGenFunction &CGF, const VarDecl &D,
         Builder.CreateICmpSGT(FirstGuardLoad, InitThreadEpoch);
     llvm::BasicBlock *AttemptInitBlock = CGF.createBasicBlock("init.attempt");
     llvm::BasicBlock *EndBlock = CGF.createBasicBlock("init.end");
-    Builder.CreateCondBr(IsUninitialized, AttemptInitBlock, EndBlock);
+    CGF.EmitCXXGuardedInitBranch(IsUninitialized, AttemptInitBlock, EndBlock,
+                                 CodeGenFunction::GuardKind::VariableGuard, &D);
 
     // This BasicBlock attempts to determine whether or not this thread is
     // responsible for doing the initialization.
@@ -3427,6 +3426,8 @@ static llvm::GlobalValue::LinkageTypes getLinkageForRTTI(QualType Ty) {
     return llvm::GlobalValue::InternalLinkage;
 
   case VisibleNoLinkage:
+  case ModuleInternalLinkage:
+  case ModuleLinkage:
   case ExternalLinkage:
     return llvm::GlobalValue::LinkOnceODRLinkage;
   }
@@ -3719,7 +3720,7 @@ CatchTypeInfo
 MicrosoftCXXABI::getAddrOfCXXCatchHandlerType(QualType Type,
                                               QualType CatchHandlerType) {
   // TypeDescriptors for exceptions never have qualified pointer types,
-  // qualifiers are stored seperately in order to support qualification
+  // qualifiers are stored separately in order to support qualification
   // conversions.
   bool IsConst, IsVolatile, IsUnaligned;
   Type =
@@ -3755,6 +3756,9 @@ llvm::Constant *MicrosoftCXXABI::getAddrOfRTTIDescriptor(QualType Type) {
   // Check to see if we've already declared this TypeDescriptor.
   if (llvm::GlobalVariable *GV = CGM.getModule().getNamedGlobal(MangledName))
     return llvm::ConstantExpr::getBitCast(GV, CGM.Int8PtrTy);
+
+  // Note for the future: If we would ever like to do deferred emission of
+  // RTTI, check if emitting vtables opportunistically need any adjustment.
 
   // Compute the fields for the TypeDescriptor.
   SmallString<256> TypeInfoString;
@@ -3802,7 +3806,7 @@ static void emitCXXDestructor(CodeGenModule &CGM, const CXXDestructorDecl *dtor,
   if (!dtor->getParent()->getNumVBases() &&
       (dtorType == StructorType::Complete || dtorType == StructorType::Base)) {
     bool ProducedAlias = !CGM.TryEmitDefinitionAsAlias(
-        GlobalDecl(dtor, Dtor_Complete), GlobalDecl(dtor, Dtor_Base), true);
+        GlobalDecl(dtor, Dtor_Complete), GlobalDecl(dtor, Dtor_Base));
     if (ProducedAlias) {
       if (dtorType == StructorType::Complete)
         return;
@@ -3872,18 +3876,21 @@ MicrosoftCXXABI::getAddrOfCXXCtorClosure(const CXXConstructorDecl *CD,
   // Following the 'this' pointer is a reference to the source object that we
   // are copying from.
   ImplicitParamDecl SrcParam(
-      getContext(), nullptr, SourceLocation(), &getContext().Idents.get("src"),
+      getContext(), /*DC=*/nullptr, SourceLocation(),
+      &getContext().Idents.get("src"),
       getContext().getLValueReferenceType(RecordTy,
-                                          /*SpelledAsLValue=*/true));
+                                          /*SpelledAsLValue=*/true),
+      ImplicitParamDecl::Other);
   if (IsCopy)
     FunctionArgs.push_back(&SrcParam);
 
   // Constructors for classes which utilize virtual bases have an additional
   // parameter which indicates whether or not it is being delegated to by a more
   // derived constructor.
-  ImplicitParamDecl IsMostDerived(getContext(), nullptr, SourceLocation(),
+  ImplicitParamDecl IsMostDerived(getContext(), /*DC=*/nullptr,
+                                  SourceLocation(),
                                   &getContext().Idents.get("is_most_derived"),
-                                  getContext().IntTy);
+                                  getContext().IntTy, ImplicitParamDecl::Other);
   // Only add the parameter to the list if thie class has virtual bases.
   if (RD->getNumVBases() > 0)
     FunctionArgs.push_back(&IsMostDerived);
@@ -3894,7 +3901,7 @@ MicrosoftCXXABI::getAddrOfCXXCtorClosure(const CXXConstructorDecl *CD,
                     FunctionArgs, CD->getLocation(), SourceLocation());
   // Create a scope with an artificial location for the body of this function.
   auto AL = ApplyDebugLocation::CreateArtificial(CGF);
-  EmitThisParam(CGF);
+  setCXXABIThisValue(CGF, loadIncomingCXXThis(CGF));
   llvm::Value *This = getThisValue(CGF);
 
   llvm::Value *SrcVal =

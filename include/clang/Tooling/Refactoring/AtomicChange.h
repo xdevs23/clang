@@ -46,6 +46,14 @@ public:
   AtomicChange(llvm::StringRef FilePath, llvm::StringRef Key)
       : Key(Key), FilePath(FilePath) {}
 
+  AtomicChange(AtomicChange &&) = default;
+  AtomicChange(const AtomicChange &) = default;
+
+  AtomicChange &operator=(AtomicChange &&) = default;
+  AtomicChange &operator=(const AtomicChange &) = default;
+
+  bool operator==(const AtomicChange &Other) const;
+
   /// \brief Returns the atomic change as a YAML string.
   std::string toYAMLString();
 
@@ -70,6 +78,12 @@ public:
 
   /// \brief Returns the error message or an empty string if it does not exist.
   const std::string &getError() const { return Error; }
+
+  /// \brief Adds a replacement that replaces the given Range with
+  /// ReplacementText.
+  /// \returns An llvm::Error carrying ReplacementError on error.
+  llvm::Error replace(const SourceManager &SM, const CharSourceRange &Range,
+                      llvm::StringRef ReplacementText);
 
   /// \brief Adds a replacement that replaces range [Loc, Loc+Length) with
   /// \p Text.
@@ -123,6 +137,8 @@ private:
   std::vector<std::string> RemovedHeaders;
   tooling::Replacements Replaces;
 };
+
+using AtomicChanges = std::vector<AtomicChange>;
 
 // Defines specs for applying changes.
 struct ApplyChangesSpec {

@@ -12,7 +12,6 @@
 #include "llvm/Support/YAMLTraits.h"
 #include <string>
 
-LLVM_YAML_IS_FLOW_SEQUENCE_VECTOR(std::string)
 LLVM_YAML_IS_SEQUENCE_VECTOR(clang::tooling::AtomicChange)
 
 namespace {
@@ -216,6 +215,15 @@ AtomicChange::AtomicChange(std::string Key, std::string FilePath,
       RemovedHeaders(std::move(RemovedHeaders)), Replaces(std::move(Replaces)) {
 }
 
+bool AtomicChange::operator==(const AtomicChange &Other) const {
+  if (Key != Other.Key || FilePath != Other.FilePath || Error != Other.Error)
+    return false;
+  if (!(Replaces == Other.Replaces))
+    return false;
+  // FXIME: Compare header insertions/removals.
+  return true;
+}
+
 std::string AtomicChange::toYAMLString() {
   std::string YamlContent;
   llvm::raw_string_ostream YamlContentStream(YamlContent);
@@ -240,6 +248,12 @@ AtomicChange AtomicChange::convertFromYAML(llvm::StringRef YAMLContent) {
     llvm::consumeError(std::move(Err));
   }
   return E;
+}
+
+llvm::Error AtomicChange::replace(const SourceManager &SM,
+                                  const CharSourceRange &Range,
+                                  llvm::StringRef ReplacementText) {
+  return Replaces.add(Replacement(SM, Range, ReplacementText));
 }
 
 llvm::Error AtomicChange::replace(const SourceManager &SM, SourceLocation Loc,

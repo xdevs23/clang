@@ -826,6 +826,34 @@ int InitListChecker::numStructUnionElements(QualType DeclType) {
   return InitializableMembers - structDecl->hasFlexibleArrayMember();
 }
 
+/// Determine whether Entity is an entity for which it is idiomatic to elide
+/// the braces in aggregate initialization.
+static bool isIdiomaticBraceElisionEntity(const InitializedEntity &Entity) {
+  // Recursive initialization of the one and only field within an aggregate
+  // class is considered idiomatic. This case arises in particular for
+  // initialization of std::array, where the C++ standard suggests the idiom of
+  //
+  //   std::array<T, N> arr = {1, 2, 3};
+  //
+  // (where std::array is an aggregate struct containing a single array field.
+
+  // FIXME: Should aggregate initialization of a struct with a single
+  // base class and no members also suppress the warning?
+  if (Entity.getKind() != InitializedEntity::EK_Member || !Entity.getParent())
+    return false;
+
+  auto *ParentRD =
+      Entity.getParent()->getType()->castAs<RecordType>()->getDecl();
+  if (CXXRecordDecl *CXXRD = dyn_cast<CXXRecordDecl>(ParentRD))
+    if (CXXRD->getNumBases())
+      return false;
+
+  auto FieldIt = ParentRD->field_begin();
+  assert(FieldIt != ParentRD->field_end() &&
+         "no fields but have initializer for member?");
+  return ++FieldIt == ParentRD->field_end();
+}
+
 /// Check whether the range of the initializer \p ParentIList from element
 /// \p Index onwards can be used to initialize an object of type \p T. Update
 /// \p Index to indicate how many elements of the list were consumed.
@@ -886,7 +914,9 @@ void InitListChecker::CheckImplicitInitList(const InitializedEntity &Entity,
     }
 
     // Complain about missing braces.
-    if (T->isArrayType() || T->isRecordType()) {
+    if ((T->isArrayType() || T->isRecordType()) &&
+        !ParentIList->isIdiomaticZeroInitializer(SemaRef.getLangOpts()) &&
+        !isIdiomaticBraceElisionEntity(Entity)) {
       SemaRef.Diag(StructuredSubobjectInitList->getLocStart(),
                    diag::warn_missing_braces)
           << StructuredSubobjectInitList->getSourceRange()
@@ -950,6 +980,7 @@ static void warnBracedScalarInit(Sema &S, const InitializedEntity &Entity,
   case InitializedEntity::EK_Base:
   case InitializedEntity::EK_Delegating:
   case InitializedEntity::EK_BlockElement:
+  case InitializedEntity::EK_LambdaToBlockConversionBlockElement:
   case InitializedEntity::EK_Binding:
     llvm_unreachable("unexpected braced scalar init");
   }
@@ -1208,7 +1239,7 @@ void InitListChecker::CheckSubElementType(const InitializedEntity &Entity,
 
   } else {
     assert((ElemType->isRecordType() || ElemType->isVectorType() ||
-            ElemType->isClkEventT()) && "Unexpected type");
+            ElemType->isOpenCLSpecificType()) && "Unexpected type");
 
     // C99 6.7.8p13:
     //
@@ -1832,7 +1863,9 @@ void InitListChecker::CheckStructUnionTypes(
   // worthwhile to skip over the rest of the initializer, though.
   RecordDecl *RD = DeclType->getAs<RecordType>()->getDecl();
   RecordDecl::field_iterator FieldEnd = RD->field_end();
-  bool CheckForMissingFields = true;
+  bool CheckForMissingFields =
+    !IList->isIdiomaticZeroInitializer(SemaRef.getLangOpts());
+
   while (Index < IList->getNumInits()) {
     Expr *Init = IList->getInit(Index);
 
@@ -2269,15 +2302,17 @@ InitListChecker::CheckDesignatedInitializer(const InitializedEntity &Entity,
           assert(StructuredList->getNumInits() == 1
                  && "A union should never have more than one initializer!");
 
-          // We're about to throw away an initializer, emit warning.
-          SemaRef.Diag(D->getFieldLoc(),
-                       diag::warn_initializer_overrides)
-            << D->getSourceRange();
           Expr *ExistingInit = StructuredList->getInit(0);
-          SemaRef.Diag(ExistingInit->getLocStart(),
-                       diag::note_previous_initializer)
-            << /*FIXME:has side effects=*/0
-            << ExistingInit->getSourceRange();
+          if (ExistingInit) {
+            // We're about to throw away an initializer, emit warning.
+            SemaRef.Diag(D->getFieldLoc(),
+                         diag::warn_initializer_overrides)
+              << D->getSourceRange();
+            SemaRef.Diag(ExistingInit->getLocStart(),
+                         diag::note_previous_initializer)
+              << /*FIXME:has side effects=*/0
+              << ExistingInit->getSourceRange();
+          }
 
           // remove existing initializer
           StructuredList->resizeInits(SemaRef.Context, 0);
@@ -2934,6 +2969,7 @@ DeclarationName InitializedEntity::getName() const {
   case EK_VectorElement:
   case EK_ComplexElement:
   case EK_BlockElement:
+  case EK_LambdaToBlockConversionBlockElement:
   case EK_CompoundLiteralInit:
   case EK_RelatedResult:
     return DeclarationName();
@@ -2963,6 +2999,7 @@ ValueDecl *InitializedEntity::getDecl() const {
   case EK_VectorElement:
   case EK_ComplexElement:
   case EK_BlockElement:
+  case EK_LambdaToBlockConversionBlockElement:
   case EK_LambdaCapture:
   case EK_CompoundLiteralInit:
   case EK_RelatedResult:
@@ -2992,6 +3029,7 @@ bool InitializedEntity::allowsNRVO() const {
   case EK_VectorElement:
   case EK_ComplexElement:
   case EK_BlockElement:
+  case EK_LambdaToBlockConversionBlockElement:
   case EK_LambdaCapture:
   case EK_RelatedResult:
     break;
@@ -3025,6 +3063,9 @@ unsigned InitializedEntity::dumpImpl(raw_ostream &OS) const {
   case EK_VectorElement: OS << "VectorElement " << Index; break;
   case EK_ComplexElement: OS << "ComplexElement " << Index; break;
   case EK_BlockElement: OS << "Block"; break;
+  case EK_LambdaToBlockConversionBlockElement:
+    OS << "Block (lambda)";
+    break;
   case EK_LambdaCapture:
     OS << "LambdaCapture ";
     OS << DeclarationName(Capture.VarID);
@@ -3522,12 +3563,13 @@ static OverloadingResult
 ResolveConstructorOverload(Sema &S, SourceLocation DeclLoc,
                            MultiExprArg Args,
                            OverloadCandidateSet &CandidateSet,
+                           QualType DestType,
                            DeclContext::lookup_result Ctors,
                            OverloadCandidateSet::iterator &Best,
                            bool CopyInitializing, bool AllowExplicit,
                            bool OnlyListConstructors, bool IsListInit,
                            bool SecondStepOfCopyInit = false) {
-  CandidateSet.clear();
+  CandidateSet.clear(OverloadCandidateSet::CSK_InitByConstructor);
 
   for (NamedDecl *D : Ctors) {
     auto Info = getConstructorInfo(D);
@@ -3578,6 +3620,50 @@ ResolveConstructorOverload(Sema &S, SourceLocation DeclLoc,
     }
   }
 
+  // FIXME: Work around a bug in C++17 guaranteed copy elision.
+  //
+  // When initializing an object of class type T by constructor
+  // ([over.match.ctor]) or by list-initialization ([over.match.list])
+  // from a single expression of class type U, conversion functions of
+  // U that convert to the non-reference type cv T are candidates.
+  // Explicit conversion functions are only candidates during
+  // direct-initialization.
+  //
+  // Note: SecondStepOfCopyInit is only ever true in this case when
+  // evaluating whether to produce a C++98 compatibility warning.
+  if (S.getLangOpts().CPlusPlus17 && Args.size() == 1 &&
+      !SecondStepOfCopyInit) {
+    Expr *Initializer = Args[0];
+    auto *SourceRD = Initializer->getType()->getAsCXXRecordDecl();
+    if (SourceRD && S.isCompleteType(DeclLoc, Initializer->getType())) {
+      const auto &Conversions = SourceRD->getVisibleConversionFunctions();
+      for (auto I = Conversions.begin(), E = Conversions.end(); I != E; ++I) {
+        NamedDecl *D = *I;
+        CXXRecordDecl *ActingDC = cast<CXXRecordDecl>(D->getDeclContext());
+        D = D->getUnderlyingDecl();
+
+        FunctionTemplateDecl *ConvTemplate = dyn_cast<FunctionTemplateDecl>(D);
+        CXXConversionDecl *Conv;
+        if (ConvTemplate)
+          Conv = cast<CXXConversionDecl>(ConvTemplate->getTemplatedDecl());
+        else
+          Conv = cast<CXXConversionDecl>(D);
+
+        if ((AllowExplicit && !CopyInitializing) || !Conv->isExplicit()) {
+          if (ConvTemplate)
+            S.AddTemplateConversionCandidate(ConvTemplate, I.getPair(),
+                                             ActingDC, Initializer, DestType,
+                                             CandidateSet, AllowExplicit,
+                                             /*AllowResultConversion*/false);
+          else
+            S.AddConversionCandidate(Conv, I.getPair(), ActingDC, Initializer,
+                                     DestType, CandidateSet, AllowExplicit,
+                                     /*AllowResultConversion*/false);
+        }
+      }
+    }
+  }
+
   // Perform overload resolution and return the result.
   return CandidateSet.BestViableFunction(S, DeclLoc, Best);
 }
@@ -3615,16 +3701,20 @@ static void TryConstructorInitialization(Sema &S,
     return;
   }
 
-  // C++1z [dcl.init]p17:
+  // C++17 [dcl.init]p17:
   //     - If the initializer expression is a prvalue and the cv-unqualified
   //       version of the source type is the same class as the class of the
   //       destination, the initializer expression is used to initialize the
   //       destination object.
   // Per DR (no number yet), this does not apply when initializing a base
   // class or delegating to another constructor from a mem-initializer.
-  if (S.getLangOpts().CPlusPlus1z &&
+  // ObjC++: Lambda captured by the block in the lambda to block conversion
+  // should avoid copy elision.
+  if (S.getLangOpts().CPlusPlus17 &&
       Entity.getKind() != InitializedEntity::EK_Base &&
       Entity.getKind() != InitializedEntity::EK_Delegating &&
+      Entity.getKind() !=
+          InitializedEntity::EK_LambdaToBlockConversionBlockElement &&
       UnwrappedArgs.size() == 1 && UnwrappedArgs[0]->isRValue() &&
       S.Context.hasSameUnqualifiedType(UnwrappedArgs[0]->getType(), DestType)) {
     // Convert qualifications if necessary.
@@ -3673,7 +3763,7 @@ static void TryConstructorInitialization(Sema &S,
     // the first phase is omitted.
     if (!(UnwrappedArgs.empty() && DestRecordDecl->hasDefaultConstructor()))
       Result = ResolveConstructorOverload(S, Kind.getLocation(), Args,
-                                          CandidateSet, Ctors, Best,
+                                          CandidateSet, DestType, Ctors, Best,
                                           CopyInitialization, AllowExplicit,
                                           /*OnlyListConstructor=*/true,
                                           IsListInit);
@@ -3687,7 +3777,7 @@ static void TryConstructorInitialization(Sema &S,
   if (Result == OR_No_Viable_Function) {
     AsInitializerList = false;
     Result = ResolveConstructorOverload(S, Kind.getLocation(), UnwrappedArgs,
-                                        CandidateSet, Ctors, Best,
+                                        CandidateSet, DestType, Ctors, Best,
                                         CopyInitialization, AllowExplicit,
                                         /*OnlyListConstructors=*/false,
                                         IsListInit);
@@ -3697,6 +3787,24 @@ static void TryConstructorInitialization(Sema &S,
                       InitializationSequence::FK_ListConstructorOverloadFailed :
                       InitializationSequence::FK_ConstructorOverloadFailed,
                                 Result);
+    return;
+  }
+
+  bool HadMultipleCandidates = (CandidateSet.size() > 1);
+
+  // In C++17, ResolveConstructorOverload can select a conversion function
+  // instead of a constructor.
+  if (auto *CD = dyn_cast<CXXConversionDecl>(Best->Function)) {
+    // Add the user-defined conversion step that calls the conversion function.
+    QualType ConvType = CD->getConversionType();
+    assert(S.Context.hasSameUnqualifiedType(ConvType, DestType) &&
+           "should not have selected this conversion function");
+    Sequence.AddUserConversionStep(CD, Best->FoundDecl, ConvType,
+                                   HadMultipleCandidates);
+    if (!S.Context.hasSameType(ConvType, DestType))
+      Sequence.AddQualificationConversionStep(DestType, VK_RValue);
+    if (IsListInit)
+      Sequence.RewrapReferenceInitList(Entity.getType(), ILE);
     return;
   }
 
@@ -3728,7 +3836,6 @@ static void TryConstructorInitialization(Sema &S,
 
   // Add the constructor initialization step. Any cv-qualification conversion is
   // subsumed by the initialization.
-  bool HadMultipleCandidates = (CandidateSet.size() > 1);
   Sequence.AddConstructorInitializationStep(
       Best->FoundDecl, CtorDecl, DestArrayType, HadMultipleCandidates,
       IsListInit | IsInitListCopy, AsInitializerList);
@@ -3971,7 +4078,7 @@ static void TryListInitialization(Sema &S,
     //     value T(v); if a narrowing conversion is required to convert v to
     //     the underlying type of T, the program is ill-formed.
     auto *ET = DestType->getAs<EnumType>();
-    if (S.getLangOpts().CPlusPlus1z &&
+    if (S.getLangOpts().CPlusPlus17 &&
         Kind.getKind() == InitializationKind::IK_DirectList &&
         ET && ET->getDecl()->isFixed() &&
         !S.Context.hasSameUnqualifiedType(E->getType(), DestType) &&
@@ -4074,7 +4181,7 @@ static OverloadingResult TryRefInitWithConversionFunction(
   // Build the candidate set directly in the initialization sequence
   // structure, so that it will persist if we fail.
   OverloadCandidateSet &CandidateSet = Sequence.getFailedCandidateSet();
-  CandidateSet.clear();
+  CandidateSet.clear(OverloadCandidateSet::CSK_InitByUserDefinedConversion);
 
   // Determine whether we are allowed to call explicit constructors or
   // explicit conversion operators.
@@ -4160,7 +4267,7 @@ static OverloadingResult TryRefInitWithConversionFunction(
   // Perform overload resolution. If it fails, return the failed result.
   OverloadCandidateSet::iterator Best;
   if (OverloadingResult Result
-        = CandidateSet.BestViableFunction(S, DeclLoc, Best, true))
+        = CandidateSet.BestViableFunction(S, DeclLoc, Best))
     return Result;
 
   FunctionDecl *Function = Best->Function;
@@ -4404,7 +4511,7 @@ static void TryReferenceInitializationCore(Sema &S,
         RefRelationship == Sema::Ref_Related)) &&
       ((InitCategory.isXValue() && !isNonReferenceableGLValue(Initializer)) ||
        (InitCategory.isPRValue() &&
-        (S.getLangOpts().CPlusPlus1z || T2->isRecordType() ||
+        (S.getLangOpts().CPlusPlus17 || T2->isRecordType() ||
          T2->isArrayType())))) {
     ExprValueKind ValueKind = InitCategory.isXValue() ? VK_XValue : VK_RValue;
     if (InitCategory.isPRValue() && T2->isRecordType()) {
@@ -4674,7 +4781,7 @@ static void TryUserDefinedConversion(Sema &S,
   // Build the candidate set directly in the initialization sequence
   // structure, so that it will persist if we fail.
   OverloadCandidateSet &CandidateSet = Sequence.getFailedCandidateSet();
-  CandidateSet.clear();
+  CandidateSet.clear(OverloadCandidateSet::CSK_InitByUserDefinedConversion);
 
   // Determine whether we are allowed to call explicit constructors or
   // explicit conversion operators.
@@ -4753,7 +4860,7 @@ static void TryUserDefinedConversion(Sema &S,
   // Perform overload resolution. If it fails, return the failed result.
   OverloadCandidateSet::iterator Best;
   if (OverloadingResult Result
-        = CandidateSet.BestViableFunction(S, DeclLoc, Best, true)) {
+        = CandidateSet.BestViableFunction(S, DeclLoc, Best)) {
     Sequence.SetOverloadFailure(
                         InitializationSequence::FK_UserConversionOverloadFailed,
                                 Result);
@@ -4780,7 +4887,7 @@ static void TryUserDefinedConversion(Sema &S,
     //     copy-initialization.
     // Note that this just performs a simple object copy from the temporary.
     //
-    // C++1z:
+    // C++17:
     //   - if the function is a constructor, the call is a prvalue of the
     //     cv-unqualified version of the destination type whose return object
     //     is initialized by the constructor. The call is used to
@@ -4789,7 +4896,7 @@ static void TryUserDefinedConversion(Sema &S,
     // Therefore we need to do nothing further.
     //
     // FIXME: Mark this copy as extraneous.
-    if (!S.getLangOpts().CPlusPlus1z)
+    if (!S.getLangOpts().CPlusPlus17)
       Sequence.AddFinalCopy(DestType);
     else if (DestType.hasQualifiers())
       Sequence.AddQualificationConversionStep(DestType, VK_RValue);
@@ -4805,13 +4912,13 @@ static void TryUserDefinedConversion(Sema &S,
     //   The call is used to direct-initialize [...] the object that is the
     //   destination of the copy-initialization.
     //
-    // In C++1z, this does not call a constructor if we enter /17.6.1:
+    // In C++17, this does not call a constructor if we enter /17.6.1:
     //   - If the initializer expression is a prvalue and the cv-unqualified
     //     version of the source type is the same as the class of the
     //     destination [... do not make an extra copy]
     //
     // FIXME: Mark this copy as extraneous.
-    if (!S.getLangOpts().CPlusPlus1z ||
+    if (!S.getLangOpts().CPlusPlus17 ||
         Function->getReturnType()->isReferenceType() ||
         !S.Context.hasSameUnqualifiedType(ConvType, DestType))
       Sequence.AddFinalCopy(DestType);
@@ -5488,6 +5595,7 @@ getAssignmentAction(const InitializedEntity &Entity, bool Diagnose = false) {
   case InitializedEntity::EK_VectorElement:
   case InitializedEntity::EK_ComplexElement:
   case InitializedEntity::EK_BlockElement:
+  case InitializedEntity::EK_LambdaToBlockConversionBlockElement:
   case InitializedEntity::EK_LambdaCapture:
   case InitializedEntity::EK_CompoundLiteralInit:
     return Sema::AA_Initializing;
@@ -5511,6 +5619,7 @@ static bool shouldBindAsTemporary(const InitializedEntity &Entity) {
   case InitializedEntity::EK_ComplexElement:
   case InitializedEntity::EK_Exception:
   case InitializedEntity::EK_BlockElement:
+  case InitializedEntity::EK_LambdaToBlockConversionBlockElement:
   case InitializedEntity::EK_LambdaCapture:
   case InitializedEntity::EK_CompoundLiteralInit:
     return false;
@@ -5537,6 +5646,7 @@ static bool shouldDestroyEntity(const InitializedEntity &Entity) {
     case InitializedEntity::EK_VectorElement:
     case InitializedEntity::EK_ComplexElement:
     case InitializedEntity::EK_BlockElement:
+    case InitializedEntity::EK_LambdaToBlockConversionBlockElement:
     case InitializedEntity::EK_LambdaCapture:
       return false;
 
@@ -5584,6 +5694,7 @@ static SourceLocation getInitializationLoc(const InitializedEntity &Entity,
   case InitializedEntity::EK_VectorElement:
   case InitializedEntity::EK_ComplexElement:
   case InitializedEntity::EK_BlockElement:
+  case InitializedEntity::EK_LambdaToBlockConversionBlockElement:
   case InitializedEntity::EK_CompoundLiteralInit:
   case InitializedEntity::EK_RelatedResult:
     return Initializer->getLocStart();
@@ -5640,7 +5751,7 @@ static ExprResult CopyObject(Sema &S,
 
   OverloadCandidateSet::iterator Best;
   switch (ResolveConstructorOverload(
-      S, Loc, CurInitExpr, CandidateSet, Ctors, Best,
+      S, Loc, CurInitExpr, CandidateSet, T, Ctors, Best,
       /*CopyInitializing=*/false, /*AllowExplicit=*/true,
       /*OnlyListConstructors=*/false, /*IsListInit=*/false,
       /*SecondStepOfCopyInit=*/true)) {
@@ -5780,7 +5891,7 @@ static void CheckCXX98CompatAccessibleCopy(Sema &S,
   // Perform overload resolution.
   OverloadCandidateSet::iterator Best;
   OverloadingResult OR = ResolveConstructorOverload(
-      S, Loc, CurInitExpr, CandidateSet, Ctors, Best,
+      S, Loc, CurInitExpr, CandidateSet, CurInitExpr->getType(), Ctors, Best,
       /*CopyInitializing=*/false, /*AllowExplicit=*/true,
       /*OnlyListConstructors=*/false, /*IsListInit=*/false,
       /*SecondStepOfCopyInit=*/true);
@@ -6021,6 +6132,7 @@ InitializedEntityOutlivesFullExpression(const InitializedEntity &Entity) {
   case InitializedEntity::EK_ArrayElement:
   case InitializedEntity::EK_VectorElement:
   case InitializedEntity::EK_BlockElement:
+  case InitializedEntity::EK_LambdaToBlockConversionBlockElement:
   case InitializedEntity::EK_ComplexElement:
     // Could not determine what the full initialization is. Assume it might not
     // outlive the full-expression.
@@ -6109,6 +6221,7 @@ static const InitializedEntity *getEntityForTemporaryLifetimeExtension(
     return FallbackDecl;
 
   case InitializedEntity::EK_BlockElement:
+  case InitializedEntity::EK_LambdaToBlockConversionBlockElement:
   case InitializedEntity::EK_LambdaCapture:
   case InitializedEntity::EK_Exception:
   case InitializedEntity::EK_VectorElement:
@@ -6309,6 +6422,10 @@ static void CheckMoveOnConstruction(Sema &S, const Expr *InitExpr,
     if (!VD || !VD->hasLocalStorage())
       return;
 
+    // __block variables are not moved implicitly.
+    if (VD->hasAttr<BlocksAttr>())
+      return;
+
     QualType SourceType = VD->getType();
     if (!SourceType->isRecordType())
       return;
@@ -6502,6 +6619,20 @@ InitializationSequence::Perform(Sema &S,
       << Init->getSourceRange();
   }
 
+  // OpenCL v2.0 s6.13.11.1. atomic variables can be initialized in global scope
+  QualType ETy = Entity.getType();
+  Qualifiers TyQualifiers = ETy.getQualifiers();
+  bool HasGlobalAS = TyQualifiers.hasAddressSpace() &&
+                     TyQualifiers.getAddressSpace() == LangAS::opencl_global;
+
+  if (S.getLangOpts().OpenCLVersion >= 200 &&
+      ETy->isAtomicType() && !HasGlobalAS &&
+      Entity.getKind() == InitializedEntity::EK_Variable && Args.size() > 0) {
+    S.Diag(Args[0]->getLocStart(), diag::err_opencl_atomic_init) << 1 <<
+    SourceRange(Entity.getDecl()->getLocStart(), Args[0]->getLocEnd());
+    return ExprError();
+  }
+
   // Diagnose cases where we initialize a pointer to an array temporary, and the
   // pointer obviously outlives the temporary.
   if (Args.size() == 1 && Args[0]->getType()->isArrayType() &&
@@ -6653,6 +6784,19 @@ InitializationSequence::Perform(Sema &S,
       if (S.CheckExceptionSpecCompatibility(CurInit.get(), DestType))
         return ExprError();
 
+      // We don't check for e.g. function pointers here, since address
+      // availability checks should only occur when the function first decays
+      // into a pointer or reference.
+      if (CurInit.get()->getType()->isFunctionProtoType()) {
+        if (auto *DRE = dyn_cast<DeclRefExpr>(CurInit.get()->IgnoreParens())) {
+          if (auto *FD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
+            if (!S.checkAddressOfFunctionIsAvailable(FD, /*Complain=*/true,
+                                                     DRE->getLocStart()))
+              return ExprError();
+          }
+        }
+      }
+
       // Even though we didn't materialize a temporary, the binding may still
       // extend the lifetime of a temporary. This happens if we bind a reference
       // to the result of a cast to reference type.
@@ -6687,14 +6831,10 @@ InitializationSequence::Perform(Sema &S,
                                   /*IsInitializerList=*/false,
                                   ExtendingEntity->getDecl());
 
-      // If we're binding to an Objective-C object that has lifetime, we
-      // need cleanups. Likewise if we're extending this temporary to automatic
-      // storage duration -- we need to register its cleanup during the
-      // full-expression's cleanups.
-      if ((S.getLangOpts().ObjCAutoRefCount &&
-           MTE->getType()->isObjCLifetimeType()) ||
-          (MTE->getStorageDuration() == SD_Automatic &&
-           MTE->getType().isDestructedType()))
+      // If we're extending this temporary to automatic storage duration -- we
+      // need to register its cleanup during the full-expression's cleanups.
+      if (MTE->getStorageDuration() == SD_Automatic &&
+          MTE->getType().isDestructedType())
         S.Cleanup.setExprNeedsCleanups(true);
 
       CurInit = MTE;
@@ -7178,7 +7318,7 @@ InitializationSequence::Perform(Sema &S,
       QualType SourceType = Init->getType();
       // Case 1
       if (Entity.isParameterKind()) {
-        if (!SourceType->isSamplerT()) {
+        if (!SourceType->isSamplerT() && !SourceType->isIntegerType()) {
           S.Diag(Kind.getLocation(), diag::err_sampler_argument_required)
             << SourceType;
           break;
@@ -7493,8 +7633,7 @@ bool InitializationSequence::Diagnose(Sema &S,
         << Args[0]->getSourceRange();
       OverloadCandidateSet::iterator Best;
       OverloadingResult Ovl
-        = FailedCandidateSet.BestViableFunction(S, Kind.getLocation(), Best,
-                                                true);
+        = FailedCandidateSet.BestViableFunction(S, Kind.getLocation(), Best);
       if (Ovl == OR_Deleted) {
         S.NoteDeletedFunction(Best->Function);
       } else {
@@ -8254,9 +8393,57 @@ Sema::PerformCopyInitialization(const InitializedEntity &Entity,
                                                            AllowExplicit);
   InitializationSequence Seq(*this, Entity, Kind, InitE, TopLevelOfInitList);
 
+  // Prevent infinite recursion when performing parameter copy-initialization.
+  const bool ShouldTrackCopy =
+      Entity.isParameterKind() && Seq.isConstructorInitialization();
+  if (ShouldTrackCopy) {
+    if (llvm::find(CurrentParameterCopyTypes, Entity.getType()) !=
+        CurrentParameterCopyTypes.end()) {
+      Seq.SetOverloadFailure(
+          InitializationSequence::FK_ConstructorOverloadFailed,
+          OR_No_Viable_Function);
+
+      // Try to give a meaningful diagnostic note for the problematic
+      // constructor.
+      const auto LastStep = Seq.step_end() - 1;
+      assert(LastStep->Kind ==
+             InitializationSequence::SK_ConstructorInitialization);
+      const FunctionDecl *Function = LastStep->Function.Function;
+      auto Candidate =
+          llvm::find_if(Seq.getFailedCandidateSet(),
+                        [Function](const OverloadCandidate &Candidate) -> bool {
+                          return Candidate.Viable &&
+                                 Candidate.Function == Function &&
+                                 Candidate.Conversions.size() > 0;
+                        });
+      if (Candidate != Seq.getFailedCandidateSet().end() &&
+          Function->getNumParams() > 0) {
+        Candidate->Viable = false;
+        Candidate->FailureKind = ovl_fail_bad_conversion;
+        Candidate->Conversions[0].setBad(BadConversionSequence::no_conversion,
+                                         InitE,
+                                         Function->getParamDecl(0)->getType());
+      }
+    }
+    CurrentParameterCopyTypes.push_back(Entity.getType());
+  }
+
   ExprResult Result = Seq.Perform(*this, Entity, Kind, InitE);
 
+  if (ShouldTrackCopy)
+    CurrentParameterCopyTypes.pop_back();
+
   return Result;
+}
+
+/// Determine whether RD is, or is derived from, a specialization of CTD.
+static bool isOrIsDerivedFromSpecializationOf(CXXRecordDecl *RD,
+                                              ClassTemplateDecl *CTD) {
+  auto NotSpecialization = [&] (const CXXRecordDecl *Candidate) {
+    auto *CTSD = dyn_cast<ClassTemplateSpecializationDecl>(Candidate);
+    return !CTSD || !declaresSameEntity(CTSD->getSpecializedTemplate(), CTD);
+  };
+  return !(NotSpecialization(RD) && RD->forallBases(NotSpecialization));
 }
 
 QualType Sema::DeduceTemplateSpecializationFromInitializer(
@@ -8325,7 +8512,7 @@ QualType Sema::DeduceTemplateSpecializationFromInitializer(
   OverloadCandidateSet::iterator Best;
   auto tryToResolveOverload =
       [&](bool OnlyListConstructors) -> OverloadingResult {
-    Candidates.clear();
+    Candidates.clear(OverloadCandidateSet::CSK_Normal);
     for (auto I = Guides.begin(), E = Guides.end(); I != E; ++I) {
       NamedDecl *D = (*I)->getUnderlyingDecl();
       if (D->isInvalidDecl())
@@ -8403,6 +8590,17 @@ QualType Sema::DeduceTemplateSpecializationFromInitializer(
           break;
         }
       }
+    } else if (ListInit->getNumInits() == 1) {
+      // C++ [over.match.class.deduct]:
+      //   As an exception, the first phase in [over.match.list] (considering
+      //   initializer-list constructors) is omitted if the initializer list
+      //   consists of a single expression of type cv U, where U is a
+      //   specialization of C or a class derived from a specialization of C.
+      Expr *E = ListInit->getInit(0);
+      auto *RD = E->getType()->getAsCXXRecordDecl();
+      if (!isa<InitListExpr>(E) && RD &&
+          isOrIsDerivedFromSpecializationOf(RD, Template))
+        TryListConstructors = false;
     }
 
     if (TryListConstructors)

@@ -2,7 +2,7 @@
 
 class S {
   int a;
-  S() : a(0) {}
+  S() : a(0) {} // expected-note {{implicitly declared private here}}
 
 public:
   S(int v) : a(v) {}
@@ -605,7 +605,7 @@ void test_with_template() {
   t1.dotest_lt(begin, end);
   t2.dotest_lt(begin, end);         // expected-note {{in instantiation of member function 'TC<GoodIter, -100>::dotest_lt' requested here}}
   dotest_gt(begin, end);            // expected-note {{in instantiation of function template specialization 'dotest_gt<GoodIter, 0>' requested here}}
-  dotest_gt<unsigned, -10>(0, 100); // expected-note {{in instantiation of function template specialization 'dotest_gt<unsigned int, -10>' requested here}}
+  dotest_gt<unsigned, 10>(0, 100);  // expected-note {{in instantiation of function template specialization 'dotest_gt<unsigned int, 10>' requested here}}
 }
 
 void test_loop_break() {
@@ -691,8 +691,9 @@ void test_loop_eh() {
 
 void test_loop_firstprivate_lastprivate() {
   S s(4);
+// expected-error@+2 {{lastprivate variable cannot be firstprivate}} expected-note@+2 {{defined as lastprivate}}
 #pragma omp target
-#pragma omp teams distribute parallel for lastprivate(s) firstprivate(s)
+#pragma omp teams distribute parallel for lastprivate(s) firstprivate(s) // expected-error {{calling a private constructor of class 'S'}}
   for (int i = 0; i < 16; ++i)
     ;
 }

@@ -211,6 +211,21 @@ void Parser::ConsumeExtraSemi(ExtraSemiKind Kind, unsigned TST) {
       << FixItHint::CreateRemoval(SourceRange(StartLoc, EndLoc));
 }
 
+bool Parser::expectIdentifier() {
+  if (Tok.is(tok::identifier))
+    return false;
+  if (const auto *II = Tok.getIdentifierInfo()) {
+    if (II->isCPlusPlusKeyword(getLangOpts())) {
+      Diag(Tok, diag::err_expected_token_instead_of_objcxx_keyword)
+          << tok::identifier << Tok.getIdentifierInfo();
+      // Objective-C++: Recover by treating this keyword as a valid identifier.
+      return false;
+    }
+  }
+  Diag(Tok, diag::err_expected) << tok::identifier;
+  return true;
+}
+
 //===----------------------------------------------------------------------===//
 // Error recovery.
 //===----------------------------------------------------------------------===//
@@ -322,21 +337,13 @@ bool Parser::SkipUntil(ArrayRef<tok::TokenKind> Toks, SkipUntilFlags Flags) {
       ConsumeBrace();
       break;
 
-    case tok::string_literal:
-    case tok::wide_string_literal:
-    case tok::utf8_string_literal:
-    case tok::utf16_string_literal:
-    case tok::utf32_string_literal:
-      ConsumeStringToken();
-      break;
-        
     case tok::semi:
       if (HasFlagsSet(Flags, StopAtSemi))
         return false;
       // FALL THROUGH.
     default:
       // Skip this token.
-      ConsumeToken();
+      ConsumeAnyToken();
       break;
     }
     isFirstTokenSkipped = false;
@@ -519,22 +526,7 @@ void Parser::LateTemplateParserCleanupCallback(void *P) {
 }
 
 bool Parser::ParseFirstTopLevelDecl(DeclGroupPtrTy &Result) {
-  // C++ Modules TS: module-declaration must be the first declaration in the
-  // file. (There can be no preceding preprocessor directives, but we expect
-  // the lexer to check that.)
-  if (Tok.is(tok::kw_module)) {
-    Result = ParseModuleDecl();
-    return false;
-  } else if (getLangOpts().getCompilingModule() ==
-             LangOptions::CMK_ModuleInterface) {
-    // FIXME: We avoid providing this diagnostic when generating an object file
-    // from an existing PCM file. This is not a good way to detect this
-    // condition; we should provide a mechanism to indicate whether we've
-    // already parsed a declaration in this translation unit and avoid calling
-    // ParseFirstTopLevelDecl in that case.
-    if (Actions.TUKind == TU_Module)
-      Diag(Tok, diag::err_expected_module_interface_decl);
-  }
+  Actions.ActOnStartOfTranslationUnit();
 
   // C11 6.9p1 says translation units must have at least one top-level
   // declaration. C++ doesn't have this restriction. We also don't want to
@@ -564,27 +556,35 @@ bool Parser::ParseTopLevelDecl(DeclGroupPtrTy &Result) {
     HandlePragmaUnused();
     return false;
 
-  case tok::kw_import:
-    Result = ParseModuleImport(SourceLocation());
+  case tok::kw_export:
+    if (NextToken().isNot(tok::kw_module))
+      break;
+    LLVM_FALLTHROUGH;
+  case tok::kw_module:
+    Result = ParseModuleDecl();
     return false;
 
   case tok::annot_module_include:
     Actions.ActOnModuleInclude(Tok.getLocation(),
                                reinterpret_cast<Module *>(
                                    Tok.getAnnotationValue()));
-    ConsumeToken();
+    ConsumeAnnotationToken();
     return false;
 
   case tok::annot_module_begin:
     Actions.ActOnModuleBegin(Tok.getLocation(), reinterpret_cast<Module *>(
                                                     Tok.getAnnotationValue()));
-    ConsumeToken();
+    ConsumeAnnotationToken();
     return false;
 
   case tok::annot_module_end:
     Actions.ActOnModuleEnd(Tok.getLocation(), reinterpret_cast<Module *>(
                                                   Tok.getAnnotationValue()));
-    ConsumeToken();
+    ConsumeAnnotationToken();
+    return false;
+
+  case tok::annot_pragma_attribute:
+    HandlePragmaAttribute();
     return false;
 
   case tok::eof:
@@ -633,6 +633,9 @@ bool Parser::ParseTopLevelDecl(DeclGroupPtrTy &Result) {
 ///           ';'
 ///
 /// [C++0x/GNU] 'extern' 'template' declaration
+///
+/// [Modules-TS] module-import-declaration
+///
 Parser::DeclGroupPtrTy
 Parser::ParseExternalDeclaration(ParsedAttributesWithRange &attrs,
                                  ParsingDeclSpec *DS) {
@@ -670,6 +673,9 @@ Parser::ParseExternalDeclaration(ParsedAttributesWithRange &attrs,
   case tok::annot_pragma_fp_contract:
     HandlePragmaFPContract();
     return nullptr;
+  case tok::annot_pragma_fp:
+    HandlePragmaFP();
+    break;
   case tok::annot_pragma_opencl_extension:
     HandlePragmaOpenCLExtension();
     return nullptr;
@@ -746,11 +752,20 @@ Parser::ParseExternalDeclaration(ParsedAttributesWithRange &attrs,
     SingleDecl = ParseObjCMethodDefinition();
     break;
   case tok::code_completion:
-      Actions.CodeCompleteOrdinaryName(getCurScope(), 
-                             CurParsedObjCImpl? Sema::PCC_ObjCImplementation
-                                              : Sema::PCC_Namespace);
+    if (CurParsedObjCImpl) {
+      // Code-complete Objective-C methods even without leading '-'/'+' prefix.
+      Actions.CodeCompleteObjCMethodDecl(getCurScope(),
+                                         /*IsInstanceMethod=*/None,
+                                         /*ReturnType=*/nullptr);
+    }
+    Actions.CodeCompleteOrdinaryName(
+        getCurScope(),
+        CurParsedObjCImpl ? Sema::PCC_ObjCImplementation : Sema::PCC_Namespace);
     cutOffParsing();
     return nullptr;
+  case tok::kw_import:
+    SingleDecl = ParseModuleImport(SourceLocation());
+    break;
   case tok::kw_export:
     if (getLangOpts().ModulesTS) {
       SingleDecl = ParseExportDeclaration();
@@ -758,6 +773,7 @@ Parser::ParseExternalDeclaration(ParsedAttributesWithRange &attrs,
     }
     // This must be 'export template'. Parse it so we can diagnose our lack
     // of support.
+    LLVM_FALLTHROUGH;
   case tok::kw_using:
   case tok::kw_namespace:
   case tok::kw_typedef:
@@ -829,6 +845,10 @@ Parser::ParseExternalDeclaration(ParsedAttributesWithRange &attrs,
 
   default:
   dont_know:
+    if (Tok.isEditorPlaceholder()) {
+      ConsumeToken();
+      return nullptr;
+    }
     // We can't tell whether this is a function-definition or declaration yet.
     return ParseDeclarationOrFunctionDefinition(attrs, DS);
   }
@@ -1061,8 +1081,9 @@ Decl *Parser::ParseFunctionDefinition(ParsingDeclarator &D,
       TemplateInfo.Kind == ParsedTemplateInfo::Template &&
       Actions.canDelayFunctionBody(D)) {
     MultiTemplateParamsArg TemplateParameterLists(*TemplateInfo.TemplateParams);
-    
-    ParseScope BodyScope(this, Scope::FnScope|Scope::DeclScope);
+
+    ParseScope BodyScope(this, Scope::FnScope | Scope::DeclScope |
+                                   Scope::CompoundStmtScope);
     Scope *ParentScope = getCurScope()->getParent();
 
     D.setFunctionDefinitionKind(FDK_Definition);
@@ -1092,7 +1113,8 @@ Decl *Parser::ParseFunctionDefinition(ParsingDeclarator &D,
            (Tok.is(tok::l_brace) || Tok.is(tok::kw_try) ||
             Tok.is(tok::colon)) && 
       Actions.CurContext->isTranslationUnit()) {
-    ParseScope BodyScope(this, Scope::FnScope|Scope::DeclScope);
+    ParseScope BodyScope(this, Scope::FnScope | Scope::DeclScope |
+                                   Scope::CompoundStmtScope);
     Scope *ParentScope = getCurScope()->getParent();
 
     D.setFunctionDefinitionKind(FDK_Definition);
@@ -1110,7 +1132,8 @@ Decl *Parser::ParseFunctionDefinition(ParsingDeclarator &D,
   }
 
   // Enter a scope for the function body.
-  ParseScope BodyScope(this, Scope::FnScope|Scope::DeclScope);
+  ParseScope BodyScope(this, Scope::FnScope | Scope::DeclScope |
+                                 Scope::CompoundStmtScope);
 
   // Tell the actions module that we have entered a function definition with the
   // specified Declarator for the function.
@@ -1657,6 +1680,8 @@ bool Parser::TryAnnotateTypeOrScopeToken() {
           return false;
         }
       }
+      if (Tok.isEditorPlaceholder())
+        return true;
 
       Diag(Tok.getLocation(), diag::err_expected_qualified_after_typename);
       return true;
@@ -1864,6 +1889,7 @@ bool Parser::isTokenEqualOrEqualTypo() {
     Diag(Tok, diag::err_invalid_token_after_declarator_suggest_equal)
         << Kind
         << FixItHint::CreateReplacement(SourceRange(Tok.getLocation()), "=");
+    LLVM_FALLTHROUGH;
   case tok::equal:
     return true;
   }
@@ -2021,30 +2047,28 @@ void Parser::ParseMicrosoftIfExistsExternalDeclaration() {
 /// Parse a C++ Modules TS module declaration, which appears at the beginning
 /// of a module interface, module partition, or module implementation file.
 ///
-///   module-declaration:   [Modules TS + P0273R0]
-///     'module' module-kind[opt] module-name attribute-specifier-seq[opt] ';'
-///   module-kind:
-///     'implementation'
-///     'partition'
+///   module-declaration:   [Modules TS + P0273R0 + P0629R0]
+///     'export'[opt] 'module' 'partition'[opt]
+///            module-name attribute-specifier-seq[opt] ';'
 ///
-/// Note that the module-kind values are context-sensitive keywords.
+/// Note that 'partition' is a context-sensitive keyword.
 Parser::DeclGroupPtrTy Parser::ParseModuleDecl() {
-  assert(Tok.is(tok::kw_module) && getLangOpts().ModulesTS &&
-         "should not be parsing a module declaration");
+  SourceLocation StartLoc = Tok.getLocation();
+
+  Sema::ModuleDeclKind MDK = TryConsumeToken(tok::kw_export)
+                                 ? Sema::ModuleDeclKind::Interface
+                                 : Sema::ModuleDeclKind::Implementation;
+
+  assert(Tok.is(tok::kw_module) && "not a module declaration");
   SourceLocation ModuleLoc = ConsumeToken();
 
-  // Check for a module-kind.
-  Sema::ModuleDeclKind MDK = Sema::ModuleDeclKind::Module;
-  if (Tok.is(tok::identifier) && NextToken().is(tok::identifier)) {
-    if (Tok.getIdentifierInfo()->isStr("implementation"))
-      MDK = Sema::ModuleDeclKind::Implementation;
-    else if (Tok.getIdentifierInfo()->isStr("partition"))
-      MDK = Sema::ModuleDeclKind::Partition;
-    else {
-      Diag(Tok, diag::err_unexpected_module_kind) << Tok.getIdentifierInfo();
-      SkipUntil(tok::semi);
-      return nullptr;
-    }
+  if (Tok.is(tok::identifier) && NextToken().is(tok::identifier) &&
+      Tok.getIdentifierInfo()->isStr("partition")) {
+    // If 'partition' is present, this must be a module interface unit.
+    if (MDK != Sema::ModuleDeclKind::Interface)
+      Diag(Tok.getLocation(), diag::err_module_implementation_partition)
+        << FixItHint::CreateInsertion(ModuleLoc, "export ");
+    MDK = Sema::ModuleDeclKind::Partition;
     ConsumeToken();
   }
 
@@ -2052,14 +2076,14 @@ Parser::DeclGroupPtrTy Parser::ParseModuleDecl() {
   if (ParseModuleName(ModuleLoc, Path, /*IsImport*/false))
     return nullptr;
 
+  // We don't support any module attributes yet; just parse them and diagnose.
   ParsedAttributesWithRange Attrs(AttrFactory);
   MaybeParseCXX11Attributes(Attrs);
-  // We don't support any module attributes yet.
   ProhibitCXX11Attributes(Attrs, diag::err_attribute_not_module_attr);
 
   ExpectAndConsumeSemi(diag::err_module_expected_semi);
 
-  return Actions.ActOnModuleDecl(ModuleLoc, MDK, Path);
+  return Actions.ActOnModuleDecl(StartLoc, ModuleLoc, MDK, Path);
 }
 
 /// Parse a module import declaration. This is essentially the same for
@@ -2070,7 +2094,7 @@ Parser::DeclGroupPtrTy Parser::ParseModuleDecl() {
 ///           '@' 'import' module-name ';'
 /// [ModTS] module-import-declaration:
 ///           'import' module-name attribute-specifier-seq[opt] ';'
-Parser::DeclGroupPtrTy Parser::ParseModuleImport(SourceLocation AtLoc) {
+Decl *Parser::ParseModuleImport(SourceLocation AtLoc) {
   assert((AtLoc.isInvalid() ? Tok.is(tok::kw_import)
                             : Tok.isObjCAtKeyword(tok::objc_import)) &&
          "Improper start to module import");
@@ -2097,7 +2121,7 @@ Parser::DeclGroupPtrTy Parser::ParseModuleImport(SourceLocation AtLoc) {
   if (Import.isInvalid())
     return nullptr;
 
-  return Actions.ConvertDeclToDeclGroup(Import.get());
+  return Import.get();
 }
 
 /// Parse a C++ Modules TS / Objective-C module name (both forms use the same
@@ -2152,7 +2176,7 @@ bool Parser::parseMisplacedModuleImport() {
         Actions.ActOnModuleEnd(Tok.getLocation(),
                                reinterpret_cast<Module *>(
                                    Tok.getAnnotationValue()));
-        ConsumeToken();
+        ConsumeAnnotationToken();
         continue;
       }
       // Inform caller that recovery failed, the error must be handled at upper
@@ -2164,7 +2188,7 @@ bool Parser::parseMisplacedModuleImport() {
       Actions.ActOnModuleBegin(Tok.getLocation(),
                                reinterpret_cast<Module *>(
                                    Tok.getAnnotationValue()));
-      ConsumeToken();
+      ConsumeAnnotationToken();
       ++MisplacedModuleBeginCount;
       continue;
     case tok::annot_module_include:
@@ -2173,7 +2197,7 @@ bool Parser::parseMisplacedModuleImport() {
       Actions.ActOnModuleInclude(Tok.getLocation(),
                                  reinterpret_cast<Module *>(
                                      Tok.getAnnotationValue()));
-      ConsumeToken();
+      ConsumeAnnotationToken();
       // If there is another module import, process it.
       continue;
     default:

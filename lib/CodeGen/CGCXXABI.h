@@ -73,9 +73,10 @@ protected:
     return CGF.CXXStructorImplicitParamValue;
   }
 
-  /// Perform prolog initialization of the parameter variable suitable
-  /// for 'this' emitted by buildThisParam.
-  void EmitThisParam(CodeGenFunction &CGF);
+  /// Loads the incoming C++ this pointer as it was passed by the caller.
+  llvm::Value *loadIncomingCXXThis(CodeGenFunction &CGF);
+
+  void setCXXABIThisValue(CodeGenFunction &CGF, llvm::Value *ThisPtr);
 
   ASTContext &getContext() const { return CGM.getContext(); }
 
@@ -358,13 +359,6 @@ public:
     return CharUnits::Zero();
   }
 
-  /// Perform ABI-specific "this" parameter adjustment in a virtual function
-  /// prologue.
-  virtual llvm::Value *adjustThisParameterInVirtualFunctionPrologue(
-      CodeGenFunction &CGF, GlobalDecl GD, llvm::Value *This) {
-    return This;
-  }
-
   /// Emit the ABI-specific prolog for the function.
   virtual void EmitInstanceFunctionProlog(CodeGenFunction &CGF) = 0;
 
@@ -392,7 +386,7 @@ public:
   isVirtualOffsetNeededForVTableField(CodeGenFunction &CGF,
                                       CodeGenFunction::VPtr Vptr) = 0;
 
-  /// Checks if ABI requires to initilize vptrs for given dynamic class.
+  /// Checks if ABI requires to initialize vptrs for given dynamic class.
   virtual bool doStructorsInitializeVPtrs(const CXXRecordDecl *VTableClass) = 0;
 
   /// Get the address point of the vtable for the given base subobject.

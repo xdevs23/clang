@@ -842,12 +842,10 @@ ExprResult ObjCPropertyOpBuilder::buildRValueOperation(Expr *op) {
           result = S.ImpCastExprToType(result.get(), propType, CK_BitCast);
       }
     }
-    if (S.getLangOpts().ObjCAutoRefCount) {
-      Qualifiers::ObjCLifetime LT = propType.getObjCLifetime();
-      if (LT == Qualifiers::OCL_Weak)
-        if (!S.Diags.isIgnored(diag::warn_arc_repeated_use_of_weak, RefExpr->getLocation()))
-              S.getCurFunction()->markSafeWeakUse(RefExpr);
-    }
+    if (propType.getObjCLifetime() == Qualifiers::OCL_Weak &&
+        !S.Diags.isIgnored(diag::warn_arc_repeated_use_of_weak,
+                           RefExpr->getLocation()))
+      S.getCurFunction()->markSafeWeakUse(RefExpr);
   }
 
   return result;
@@ -963,11 +961,11 @@ ObjCPropertyOpBuilder::buildIncDecOperation(Scope *Sc, SourceLocation opcLoc,
 }
 
 ExprResult ObjCPropertyOpBuilder::complete(Expr *SyntacticForm) {
-  if (S.getLangOpts().ObjCAutoRefCount && isWeakProperty() &&
+  if (isWeakProperty() &&
       !S.Diags.isIgnored(diag::warn_arc_repeated_use_of_weak,
                          SyntacticForm->getLocStart()))
-      S.recordUseOfEvaluatedWeak(SyntacticRefExpr,
-                                 SyntacticRefExpr->isMessagingGetter());
+    S.recordUseOfEvaluatedWeak(SyntacticRefExpr,
+                               SyntacticRefExpr->isMessagingGetter());
 
   return PseudoOpBuilder::complete(SyntacticForm);
 }
@@ -1128,8 +1126,8 @@ static void CheckKeyForObjCARCConversion(Sema &S, QualType ContainerT,
   if (!Getter)
     return;
   QualType T = Getter->parameters()[0]->getType();
-  S.CheckObjCARCConversion(Key->getSourceRange(), 
-                         T, Key, Sema::CCK_ImplicitConversion);
+  S.CheckObjCConversion(Key->getSourceRange(), T, Key,
+                        Sema::CCK_ImplicitConversion);
 }
 
 bool ObjCSubscriptOpBuilder::findAtIndexGetter() {
@@ -1178,8 +1176,6 @@ bool ObjCSubscriptOpBuilder::findAtIndexGetter() {
   
   AtIndexGetter = S.LookupMethodInObjectType(AtIndexGetterSelector, ResultType, 
                                              true /*instance*/);
-  bool receiverIdType = (BaseT->isObjCIdType() ||
-                         BaseT->isObjCQualifiedIdType());
   
   if (!AtIndexGetter && S.getLangOpts().DebuggerObjCLiteral) {
     AtIndexGetter = ObjCMethodDecl::Create(S.Context, SourceLocation(), 
@@ -1205,7 +1201,7 @@ bool ObjCSubscriptOpBuilder::findAtIndexGetter() {
   }
 
   if (!AtIndexGetter) {
-    if (!receiverIdType) {
+    if (!BaseT->isObjCIdType()) {
       S.Diag(BaseExpr->getExprLoc(), diag::err_objc_subscript_method_not_found)
       << BaseExpr->getType() << 0 << arrayRef;
       return false;
@@ -1286,9 +1282,6 @@ bool ObjCSubscriptOpBuilder::findAtIndexSetter() {
   }
   AtIndexSetter = S.LookupMethodInObjectType(AtIndexSetterSelector, ResultType, 
                                              true /*instance*/);
-  
-  bool receiverIdType = (BaseT->isObjCIdType() ||
-                         BaseT->isObjCQualifiedIdType());
 
   if (!AtIndexSetter && S.getLangOpts().DebuggerObjCLiteral) {
     TypeSourceInfo *ReturnTInfo = nullptr;
@@ -1323,7 +1316,7 @@ bool ObjCSubscriptOpBuilder::findAtIndexSetter() {
   }
   
   if (!AtIndexSetter) {
-    if (!receiverIdType) {
+    if (!BaseT->isObjCIdType()) {
       S.Diag(BaseExpr->getExprLoc(), 
              diag::err_objc_subscript_method_not_found)
       << BaseExpr->getType() << 1 << arrayRef;
@@ -1449,8 +1442,7 @@ MSPropertyOpBuilder::getBaseMSProperty(MSPropertySubscriptExpr *E) {
 
 Expr *MSPropertyOpBuilder::rebuildAndCaptureObject(Expr *syntacticBase) {
   InstanceBase = capture(RefExpr->getBaseExpr());
-  std::for_each(CallArgs.begin(), CallArgs.end(),
-                [this](Expr *&Arg) { Arg = capture(Arg); });
+  llvm::for_each(CallArgs, [this](Expr *&Arg) { Arg = capture(Arg); });
   syntacticBase = Rebuilder(S, [=](Expr *, unsigned Idx) -> Expr * {
                     switch (Idx) {
                     case 0:

@@ -272,6 +272,14 @@
 // AESNOSSE2-NOT: #define __SSE2__ 1
 // AESNOSSE2-NOT: #define __SSE3__ 1
 
+// RUN: %clang -target i386-unknown-unknown -march=pentiumpro -mlwp -x c -E -dM -o - %s | FileCheck -match-full-lines --check-prefix=LWP %s
+
+// LWP: #define __LWP__ 1
+
+// RUN: %clang -target i386-unknown-unknown -march=bdver1 -mno-lwp -x c -E -dM -o - %s | FileCheck -match-full-lines --check-prefix=NOLWP %s
+
+// NOLWP-NOT: #define __LWP__ 1
+
 // RUN: %clang -target i386-unknown-unknown -march=pentiumpro -msha -x c -E -dM -o - %s | FileCheck -match-full-lines --check-prefix=SHA %s
 
 // SHA: #define __SHA__ 1
@@ -324,6 +332,10 @@
 // RUN: %clang -target i386-unknown-unknown -march=atom -madx -x c -E -dM -o - %s | FileCheck -match-full-lines --check-prefix=ADX %s
 
 // ADX: #define __ADX__ 1
+
+// RUN: %clang -target i386-unknown-unknown -mshstk -x c -E -dM -o - %s | FileCheck -match-full-lines --check-prefix=CETSS %s
+
+// CETSS: #define __SHSTK__ 1
 
 // RUN: %clang -target i386-unknown-unknown -march=atom -mrdseed -x c -E -dM -o - %s | FileCheck -match-full-lines --check-prefix=RDSEED %s
 
